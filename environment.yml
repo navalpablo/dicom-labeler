@@ -1,0 +1,21 @@
+name: dicom-labeler
+channels:
+  - conda-forge
+dependencies:
+  
+  - python>=3.11  
+  - pip           
+
+  
+  - pydicom>=3.0
+  - numpy
+  - pillow>=10.0
+  - flask>=2.3
+  - tqdm
+  - pytest      
+  - black       
+  - pylibjpeg
+  - pylibjpeg-libjpeg
+  - pylibjpeg-openjpeg
+
+  

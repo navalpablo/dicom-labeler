@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+
+{% block title %}Page {{ page_num }} – DICOM Series Labeler{% endblock %}
+
+{% block content %}
+<form method="post" action="{{ url_for('save_page', page_num=page_num) }}">
+
+  {% for series in series_batch %}
+    {% set uid = series["Series Instance UID"] or series["0020000E"] %}
+    {% set is_done = series["Annotation"] %}
+    <div class="series-card {% if is_done %}done{% endif %}">
+      <div class="meta">
+        <strong>Series {{ series["Series Number"] }}</strong>
+        &mdash; {{ series["Series Description"] or series["Protocol Name"] or "--" }}
+      </div>
+
+      <!-- thumbnail scroll strip -->
+      <div class="scroll-box">
+        {% for idx in range(8) %}
+          <img src="{{ url_for('previews', filename=uid ~ '_slice' ~ idx ~ '.webp') }}"
+               alt="slice {{ idx }}"
+               onerror="this.style.display='none';">
+        {% endfor %}
+      </div>
+
+      <!-- label input -->
+      <div style="margin-top:.4rem;">
+        <label for="label_{{ uid }}">Label</label>
+        <input list="label-options"
+               name="label_{{ uid }}"
+               id="label_{{ uid }}"
+               value="{{ series['Annotation'] }}"
+               placeholder="select or type…">
+      </div>
+    </div>
+  {% endfor %}
+
+  <!-- datalist rendered once per page -->
+  <datalist id="label-options">
+    {% for l in labels %}
+      <option value="{{ l }}">
+    {% endfor %}
+  </datalist>
+
+  <button type="submit" style="padding:.5rem 1.2rem; font-size:1rem;">Save Annotations</button>
+</form>
+
+<!-- page navigation -->
+<div class="nav">
+  {% if page_num > 1 %}
+    <a href="{{ url_for('page', page_num=page_num-1) }}">&laquo; Prev</a>
+  {% endif %}
+  <span style="padding:.4rem 1rem; border:1px solid #ccc; border-radius:4px;">Page {{ page_num }} / {{ total_pages }}</span>
+  {% if page_num < total_pages %}
+    <a href="{{ url_for('page', page_num=page_num+1) }}">Next &raquo;</a>
+  {% endif %}
+</div>
+{% endblock %}
