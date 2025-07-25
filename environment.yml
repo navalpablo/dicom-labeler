@@ -3,19 +3,17 @@ channels:
   - conda-forge
 dependencies:
   
-  - python>=3.11  
+  - python=3.13  
   - pip           
-
-  
-  - pydicom>=3.0
-  - numpy
-  - pillow>=10.0
-  - flask>=2.3
-  - tqdm
-  - pytest      
-  - black       
-  - pylibjpeg
-  - pylibjpeg-libjpeg
-  - pylibjpeg-openjpeg
+  - pydicom=3.0
+  - numpy=2.3
+  - pillow=11.3
+  - flask=3.1
+  - tqdm=4.67
+  - pytest=8.4      
+  - black=25.1       
+  - pylibjpeg=2.0
+  - pylibjpeg-libjpeg=2.3
+  - pylibjpeg-openjpeg=2.4
 
   

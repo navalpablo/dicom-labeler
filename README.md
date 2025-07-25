@@ -14,7 +14,7 @@ appended to **labels_config.txt**.
 
 ```bash
 # 1 · create & activate conda env
-mamba env create -f environment.yml        # or: conda env create -f ...
+conda env create -f environment.yml        
 conda activate dicom-labeler
 
 # 2 · extract one row per series
@@ -28,10 +28,18 @@ python generate_previews.py \
     --manifest series_info.tsv \
     --outdir previews
 
-# 4 · launch labeling UI
+# 4 · launch labeling UI (bash)
 export FLASK_APP=label_server.app
 flask run                                   # open http://localhost:5000/
+
+# 4 · launch labeling UI (cmd)
+set FLASK_APP=label_server.app:create_flask_app
+flask run                                  # open http://localhost:5000/
+
+
 ```
+
+
 
 ---
 

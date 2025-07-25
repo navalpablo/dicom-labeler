@@ -3,39 +3,32 @@
 extract_dicom_headers.py
 ------------------------
 
-Step 1 of the DICOM-labeling pipeline.
-
-Usage
------
-    python extract_dicom_headers.py \
-        --dicom /path/to/dicom_root \
-        --output series_info.tsv
-
-    # Read every DICOM file (slower but safest)
-    python extract_dicom_headers.py \
-        --dicom /path/to/dicom_root \
-        --output series_info.tsv \
-        --read_all
+• One row per SeriesInstanceUID
+• Adds "Example File" (first slice path)
+• Adds "Plane Orientation"  (axial / coronal / sagittal / oblique / '')
+  – finds ImageOrientationPatient in classic *and* enhanced multi‑frame
+  – fallback 1: infers from PatientOrientation (0020,0020)
+  – fallback 2: infers from ImagePositionPatient changes across slices
+• Keeps/merges existing Annotation column if TSV already exists
 """
-import argparse
-import csv
-import os
-import sys
+from __future__ import annotations
+
+import argparse, csv, os, sys
 from collections import OrderedDict, defaultdict
 from pathlib import Path
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, Tuple, List, Optional
 
+import numpy as np
 import pydicom
 from pydicom.errors import InvalidDicomError
 from tqdm import tqdm
 
+SCRIPT_DIR   = Path(__file__).resolve().parent
+DEFAULT_TSV  = SCRIPT_DIR / "series_info.tsv"        # <── hard‑coded
 
-###############################################################################
-# Configuration
-###############################################################################
-
-# Mapping from tag hex string → human-readable column name.
-# Feel free to add/remove as needed.
+# -------------------------------------------------------------------- #
+# Tag → column‑name mapping
+# -------------------------------------------------------------------- #
 DICOM_FIELD_MAPPING: Dict[str, str] = OrderedDict(
     [
         ("00100010", "Patient Name"),
@@ -55,6 +48,7 @@ DICOM_FIELD_MAPPING: Dict[str, str] = OrderedDict(
         ("00200011", "Series Number"),
         ("0008103E", "Series Description"),
         ("0020000E", "Series Instance UID"),
+        ("00200037", "Image Orientation (Patient)"),   # for single‑frame
         ("00540081", "Number of Slices"),
         ("00181310", "Acquisition Matrix"),
         ("00280030", "Pixel Spacing"),
@@ -72,196 +66,211 @@ DICOM_FIELD_MAPPING: Dict[str, str] = OrderedDict(
         ("00201209", "Number Series Related Instances"),
     ]
 )
+FIELDS = list(DICOM_FIELD_MAPPING.keys())
 
-FIELDS: List[str] = list(DICOM_FIELD_MAPPING.keys())
-HEADER_ROW: List[str] = list(DICOM_FIELD_MAPPING.values()) + ["Annotation"]
+EXAMPLE_COL = "Example File"
+PLANE_COL   = "Plane Orientation"
+HEADER_ROW  = list(DICOM_FIELD_MAPPING.values()) + [EXAMPLE_COL, PLANE_COL, "Annotation"]
 
+# -------------------------------------------------------------------- #
+# Orientation → plane helper
+# -------------------------------------------------------------------- #
+def determine_plane(ori: List[float]) -> str:
+    if len(ori) != 6:
+        return ""
+    row, col = ori[:3], ori[3:]
+    normal = np.cross(row, col)
+    idx = int(np.argmax(np.abs(normal)))  # 0=x,1=y,2=z
+    major = np.abs(normal[idx])
+    if major < 0.8:  # > ~36° from any axis → oblique
+        return "oblique"
+    return ("sagittal", "coronal", "axial")[idx]
 
-###############################################################################
-# Helpers
-###############################################################################
+def infer_plane_from_patient_orientation(po: str) -> str:
+    if not po:
+        return ""
+    parts = po.upper().split('\\')
+    if len(parts) != 2:
+        return ""
+    row_dir = parts[0][0] if len(parts[0]) > 0 else ''
+    col_dir = parts[1][0] if len(parts[1]) > 0 else ''
+    if not row_dir or not col_dir:
+        return ""
+    if row_dir in 'RL' and col_dir in 'AP':
+        return "axial"
+    if row_dir in 'RL' and col_dir in 'HF':
+        return "coronal"
+    if row_dir in 'AP' and col_dir in 'HF':
+        return "sagittal"
+    # Negate directions or combinations might still fit
+    if row_dir in 'AP' and col_dir in 'RL':
+        return "axial"  # rotated axial
+    if row_dir in 'HF' and col_dir in 'RL':
+        return "coronal"  # rotated
+    if row_dir in 'HF' and col_dir in 'AP':
+        return "sagittal"  # rotated
+    return "oblique"
 
+def _orientation_from_ds(ds: pydicom.Dataset) -> Optional[List[float]]:
+    """Return 6 floats if found (classic or enhanced)."""
+    # 1) single‑frame
+    elem = ds.get((0x0020, 0x0037))
+    if elem and len(elem.value) == 6:
+        return [float(v) for v in elem.value]
 
-def hex_string_to_tag(hex_str: str) -> Tuple[int, int]:
-    """Convert a 8-char hex string (e.g. '00080020') to (group, element) ints."""
-    group, element = hex_str[:4], hex_str[4:]
-    return int(group, 16), int(element, 16)
+    # 2) Enhanced MR/CT: Shared FG
+    sfg = ds.get("SharedFunctionalGroupsSequence")
+    if sfg:
+        try:
+            ori = sfg[0].PlaneOrientationSequence[0].ImageOrientationPatient
+            if len(ori) == 6:
+                return [float(v) for v in ori]
+        except Exception:
+            pass
 
+    # 3) Per‑frame FG (fallback)
+    pfg = ds.get("PerFrameFunctionalGroupsSequence")
+    if pfg:
+        try:
+            ori = pfg[0].PlaneOrientationSequence[0].ImageOrientationPatient
+            if len(ori) == 6:
+                return [float(v) for v in ori]
+        except Exception:
+            pass
+    return None
 
-def find_dicom_files(root_dir: Path, read_all: bool) -> Iterator[Path]:
-    """
-    Walk *root_dir* and yield DICOM file paths.
+# -------------------------------------------------------------------- #
+def hex_tag(h: str) -> Tuple[int, int]:
+    return int(h[:4], 16), int(h[4:], 16)
 
-    We assume a series lives inside its own folder; only one file is needed
-    per series for header extraction unless --read_all is passed.
-    """
-    for dirpath, _dirs, files in os.walk(root_dir):
-        # Heuristic: stop descending once we find DICOMs in a leaf folder.
-        # Grab the first file(s) in this folder, not all descendant folders.
-        if files:
-            file_paths = [Path(dirpath) / f for f in files]
-            file_paths.sort()  # deterministic order
-            for fp in (file_paths if read_all else file_paths[:5]):
-                yield fp
-
-
-def extract_header_fields(dcm_path: Path, fields: List[str]) -> Dict[str, str]:
-    """
-    Read *dcm_path* header (skip pixels) and return {tag_hex: value}.
-    Missing tags → ''.
-    """
+def extract_header(fp: Path) -> Tuple[Dict[str, str], Optional[List[float]], int]:
     try:
-        ds = pydicom.dcmread(dcm_path, stop_before_pixels=True, force=True)
-    except (InvalidDicomError, OSError) as exc:
-        print(f"[WARN] Skipping {dcm_path}: {exc}", file=sys.stderr)
-        return {}
+        ds = pydicom.dcmread(fp, stop_before_pixels=True, force=True)
+    except (InvalidDicomError, OSError):
+        return {}, None, 0
+    out: Dict[str, str] = {}
+    for key in FIELDS:
+        elem = ds.get(hex_tag(key))
+        out[key] = str(elem.value) if elem else ""
 
-    info: Dict[str, str] = {}
-    for field in fields:
-        tag = hex_string_to_tag(field)
-        info[field] = str(ds.get(tag, ""))  # '' if missing
-    return info
+    ori = _orientation_from_ds(ds)
+    plane = determine_plane(ori) if ori else ""
+    if not plane:
+        po = ''
+        if 'PatientOrientation' in ds:
+            po_val = ds.PatientOrientation
+            po = '\\'.join(po_val) if isinstance(po_val, (list, tuple)) else str(po_val)
+        plane = infer_plane_from_patient_orientation(po)
+    out[PLANE_COL] = plane
 
+    pos_elem = ds.get((0x0020, 0x0032))
+    pos = [float(v) for v in pos_elem.value] if pos_elem and len(pos_elem.value) == 3 else None
 
-###############################################################################
-# Main extraction routine
-###############################################################################
+    inst = int(ds.get((0x0020, 0x0013)).value) if ds.get((0x0020, 0x0013)) else 0
 
+    return out, pos, inst
 
-def build_series_manifest(
-    dicom_root: Path, read_all: bool
-) -> Tuple[Dict[Tuple[str, str], Dict[str, str]], Dict[str, List[Path]]]:
-    """
-    Return:
-        unique_sequences: {(StudyUID, SeriesUID): field_dict}
-        series_to_filelist: {SeriesUID: [example file paths]}
-    """
-    unique_sequences: Dict[Tuple[str, str], Dict[str, str]] = OrderedDict()
-    series_to_filelist: Dict[str, List[Path]] = defaultdict(list)
+def find_files(root: Path, read_all: bool):
+    for d, _, files in os.walk(root):
+        files.sort()
+        for f in (files if read_all else files[:5]):
+            yield Path(d) / f
 
-    files = list(find_dicom_files(dicom_root, read_all))
-    for fp in tqdm(files, desc="Reading DICOM headers"):
-        info = extract_header_fields(fp, FIELDS)
+# -------------------------------------------------------------------- #
+def build_series_manifest(root: Path, read_all: bool):
+    manifest: Dict[Tuple[str,str], Dict[str,str]] = OrderedDict()
+    pos_per_series: defaultdict[Tuple[str,str], List[Tuple[int, List[float]]]] = defaultdict(list)
+
+    for fp in tqdm(list(find_files(root, read_all)), desc="Reading headers"):
+        info, pos, inst = extract_header(fp)
         if not info:
             continue
-
         study_uid = info.get("0020000D", "")
         series_uid = info.get("0020000E", "")
-
         if not (study_uid and series_uid):
-            # Skip files lacking critical identifiers
             continue
-
-        series_to_filelist[series_uid].append(fp)
-
         key = (study_uid, series_uid)
-        if key not in unique_sequences:
-            # Keep the first representative header we encounter
-            unique_sequences[key] = info
+        if key not in manifest:
+            info[EXAMPLE_COL] = str(fp)
+            manifest[key] = info
+        if pos:
+            pos_per_series[key].append((inst, pos))
 
-    return unique_sequences, series_to_filelist
+    # Fallback inference for series without plane (position changes)
+    for key, row in manifest.items():
+        if row[PLANE_COL]:
+            continue  # already set
+        poss = pos_per_series[key]
+        if len(poss) < 2:
+            continue
+        poss.sort(key=lambda x: x[0])
+        p1 = np.array(poss[0][1])
+        p2 = np.array(poss[1][1])
+        delta = p2 - p1
+        if np.linalg.norm(delta) == 0:
+            continue
+        norm_delta = delta / np.linalg.norm(delta)
+        idx = int(np.argmax(np.abs(norm_delta)))
+        major = np.abs(norm_delta[idx])
+        if major < 0.8:
+            row[PLANE_COL] = "oblique"
+        else:
+            row[PLANE_COL] = ("sagittal", "coronal", "axial")[idx]
 
+    return manifest
 
-def merge_with_existing(
-    output_tsv: Path, new_sequences: Dict[Tuple[str, str], Dict[str, str]]
-) -> Dict[Tuple[str, str], Dict[str, str]]:
-    """
-    If *output_tsv* already exists, keep previous Annotation values.
-
-    We return a merged dict that preserves any prior annotations.
-    """
-    if not output_tsv.exists():
-        return new_sequences
-
-    merged = new_sequences.copy()
-    with output_tsv.open(newline="") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        for row in reader:
-            study_uid = row.get("Study Instance UID") or row.get("0020000D", "")
-            series_uid = row.get("Series Instance UID") or row.get("0020000E", "")
-            key = (study_uid, series_uid)
+def merge_existing(out_tsv: Path, fresh):
+    if not out_tsv.exists():
+        return fresh
+    merged = fresh.copy()
+    with out_tsv.open(newline="") as f:
+        rdr = csv.DictReader(f, delimiter="\t")
+        for row in rdr:
+            key = (row.get("Study Instance UID") or row.get("0020000D",""),
+                   row.get("Series Instance UID") or row.get("0020000E",""))
             if key not in merged:
-                # Series disappeared from disk?  Keep anyway.
-                merged[key] = {hex_key: row.get(DICOM_FIELD_MAPPING[hex_key], "")
-                               for hex_key in FIELDS}
-            # Carry over existing Annotation, if any
-            annotation = row.get("Annotation", "")
-            merged[key]["Annotation"] = annotation
-
+                merged[key] = {tag: row.get(DICOM_FIELD_MAPPING[tag], "")
+                               for tag in FIELDS}
+            merged[key][EXAMPLE_COL] = row.get(EXAMPLE_COL, merged[key].get(EXAMPLE_COL,""))
+            merged[key][PLANE_COL]   = row.get(PLANE_COL,   merged[key].get(PLANE_COL,""))
+            merged[key]["Annotation"]= row.get("Annotation","")
     return merged
 
+def write_manifest(data, out_tsv: Path):
+    with out_tsv.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=HEADER_ROW, delimiter="\t")
+        w.writeheader()
+        for info in data.values():
+            row = {DICOM_FIELD_MAPPING[k]: info.get(k,"") for k in FIELDS}
+            row[EXAMPLE_COL] = info.get(EXAMPLE_COL,"")
+            row[PLANE_COL]   = info.get(PLANE_COL,"")
+            row["Annotation"]= info.get("Annotation","")
+            w.writerow(row)
 
-def write_manifest(manifest: Dict[Tuple[str, str], Dict[str, str]], output_tsv: Path):
-    """Write TSV with header row (readable names) + Annotation column."""
-    with output_tsv.open("w", newline="") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=HEADER_ROW, delimiter="\t", extrasaction="ignore"
-        )
-        writer.writeheader()
-        for info in manifest.values():
-            # Map hex tags → readable column names
-            row = {DICOM_FIELD_MAPPING[tag]: info.get(tag, "") for tag in FIELDS}
-            row.setdefault("Annotation", info.get("Annotation", ""))
-            writer.writerow(row)
-
-
-###############################################################################
-# CLI
-###############################################################################
-
-
+# -------------------------------------------------------------------- #
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Extract one row per DICOM series and build/update series_info.tsv",
+    p = argparse.ArgumentParser(
+        description="Extract one row per DICOM series; output fixed to series_info.tsv",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--dicom",
-        required=True,
-        type=Path,
-        help="Root directory containing subject/studydate/series/* DICOM files",
-    )
-    parser.add_argument(
-        "--output",
-        default=Path("series_info.tsv"),
-        type=Path,
-        help="Destination TSV manifest",
-    )
-    parser.add_argument(
-        "--read_all",
-        action="store_true",
-        help="Inspect every file (instead of first 5) in each series folder",
-    )
-    return parser.parse_args()
+    p.add_argument("--dicom", required=True, type=Path, help="DICOM root folder")
+    p.add_argument("--read_all", action="store_true",
+                   help="Inspect every file in each folder (slow)")
+    return p.parse_args()
 
 
 def main():
     args = parse_args()
-
     if not args.dicom.exists():
-        sys.exit(f"[ERROR] DICOM root {args.dicom} does not exist")
+        sys.exit(f"[ERROR] DICOM root {args.dicom} not found")
 
-    # ------------------------------------------------------------
-    # 1. Scan DICOMs → fresh manifest
-    # ------------------------------------------------------------
-    fresh_manifest, _series2files = build_series_manifest(args.dicom, args.read_all)
+    fresh = build_series_manifest(args.dicom, args.read_all)
+    merged   = merge_existing(DEFAULT_TSV, fresh)
+    write_manifest(merged, DEFAULT_TSV)
 
-    # ------------------------------------------------------------
-    # 2. Merge with previous annotations (if output exists)
-    # ------------------------------------------------------------
-    merged_manifest = merge_with_existing(args.output, fresh_manifest)
-
-    # ------------------------------------------------------------
-    # 3. Write out TSV
-    # ------------------------------------------------------------
-    write_manifest(merged_manifest, args.output)
-
-    print(
-        f"\n✅  Wrote {len(merged_manifest)} series rows to {args.output.resolve()}\n"
-        "   Re-run this script any time you add more DICOMs — "
-        "existing Annotation values are preserved."
-    )
-
+    print(f"✅  Manifest written to {DEFAULT_TSV.relative_to(SCRIPT_DIR)} "
+          f"({len(merged):,} series)")
+# -----------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()

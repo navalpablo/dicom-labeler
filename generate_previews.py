@@ -1,211 +1,158 @@
 #!/usr/bin/env python3
 """
-generate_previews.py
---------------------
-
-Step 2 of the DICOM-labeling pipeline.
-Create 8 WebP thumbnails per series so the web UI can scroll through them.
-
-Usage
------
-    python generate_previews.py \
-        --dicom /path/to/dicom_root \
-        --manifest series_info.tsv \
-        --outdir previews
-
-    # Force regeneration even if previews already exist
-    python generate_previews.py ... --overwrite
+generate_previews.py – final, fault‑tolerant
+============================================
+• Reads ./series_info.tsv
+• Writes WebPs to ./previews/
+• Parallel per‑series, skips non‑image files, RGB→gray, etc.
 """
 from __future__ import annotations
 
-import argparse
-import json
-import os
-import sys
+import argparse, json, multiprocessing, sys, traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
-import numpy as np
-import pydicom
+import numpy as np, pydicom
 from PIL import Image
+from pydicom import dcmread
 from pydicom.errors import InvalidDicomError
 from tqdm import tqdm
 
-###############################################################################
-# Helpers
-###############################################################################
+# -------- fixed locations (repo root) -----------------------------------
+SCRIPT_DIR   = Path(__file__).resolve().parent
+MANIFEST_TSV = SCRIPT_DIR / "series_info.tsv"
+PREVIEWS_DIR = SCRIPT_DIR / "previews"
+EXAMPLE_COL  = "Example File"
+# ------------------------------------------------------------------------
 
 
-def safe_instance_number(ds: pydicom.Dataset, default: int) -> int:
-    """Return InstanceNumber if present, else *default*."""
-    try:
-        return int(ds.InstanceNumber)
-    except Exception:
-        return default
+# --------------------------- helpers ------------------------------------
+def normalize_uint8(arr: np.ndarray) -> np.ndarray:
+    lo, hi = np.percentile(arr.astype(np.float32), (1, 99))
+    if hi <= lo:
+        lo, hi = arr.min(), arr.max() or 1
+    return ((np.clip(arr, lo, hi) - lo) / (hi - lo) * 255).astype(np.uint8)
 
 
-def normalize_to_uint8(arr: np.ndarray) -> np.ndarray:
-    """
-    Robust 1–99 percentile window, then scale to 0-255 uint8.
-    Works for int16 or float pixel data.
-    """
-    arr = arr.astype(np.float32)
-    low, high = np.percentile(arr, [1, 99])
-    if high <= low:  # fallback if image is flat
-        low, high = arr.min(), arr.max() or 1.0
-    arr = np.clip(arr, low, high)
-    arr = (arr - low) / (high - low) * 255.0
-    return arr.astype(np.uint8)
+def to_grayscale(arr: np.ndarray) -> np.ndarray:
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 3:
+        return arr.mean(axis=-1)
+    raise ValueError("Unsupported pixel array shape")
 
 
-def save_slice_webp(ds: pydicom.Dataset, out_path: Path):
-    """Convert pydicom dataset *ds* to 8-bit grayscale WebP at *out_path*."""
-    arr = normalize_to_uint8(ds.pixel_array)
-    # PIL expects (H, W) or (H, W, 3); single channel → mode 'L'
-    Image.fromarray(arr, mode="L").save(out_path, format="WEBP", quality=85)
+def save_slice(ds: pydicom.Dataset, dst: Path):
+    Image.fromarray(normalize_uint8(to_grayscale(ds.pixel_array)), mode="L") \
+         .save(dst, format="WEBP", quality=85)
 
 
-def gather_series_files(dicom_root: Path) -> Dict[str, List[Path]]:
-    """
-    Walk *dicom_root* and build {SeriesInstanceUID: [file paths]}.
-    """
-    series_files: Dict[str, List[Path]] = {}
-    for dirpath, _dirs, files in os.walk(dicom_root):
-        for fname in files:
-            fpath = Path(dirpath) / fname
-            try:
-                ds = pydicom.dcmread(fpath, stop_before_pixels=True, force=True)
-                series_uid = str(ds.SeriesInstanceUID)
-                series_files.setdefault(series_uid, []).append(fpath)
-            except (InvalidDicomError, AttributeError, KeyError):
-                # Skip non-DICOM or DICOMs without SeriesInstanceUID
-                continue
-    # Sort paths for each series by InstanceNumber (fallback to filename)
-    for uid, flist in series_files.items():
-        def sort_key(fp: Path):
-            try:
-                ds = pydicom.dcmread(fp, stop_before_pixels=True, force=True)
-                return safe_instance_number(ds, default=-1)
-            except Exception:
-                return -1
-        flist.sort(key=sort_key)
-    return series_files
+def choose_indices(n: int, k: int = 8) -> List[int]:
+    return list(range(n)) if n <= k else [round(i * (n - 1) / (k - 1)) for i in range(k)]
 
 
-def choose_slice_indices(n_slices: int, n_pick: int = 8) -> List[int]:
-    """
-    Return *n_pick* indices evenly spaced from 0..n_slices-1 (inclusive).
-    If n_slices < n_pick, return every slice index (no duplication).
-    """
-    if n_slices <= n_pick:
-        return list(range(n_slices))
-    return [round(i * (n_slices - 1) / (n_pick - 1)) for i in range(n_pick)]
+def load_manifest() -> Dict[str, Path]:
+    if not MANIFEST_TSV.exists():
+        sys.exit(f"[ERROR] Manifest {MANIFEST_TSV} not found")
+    uid_map: Dict[str, Path] = {}
+    with MANIFEST_TSV.open() as f:
+        header = f.readline().rstrip("\n").split("\t")
+        uid_idx, ex_idx = header.index("Series Instance UID"), header.index(EXAMPLE_COL)
+        for line in f:
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) > max(uid_idx, ex_idx):
+                uid, ex = cols[uid_idx], cols[ex_idx]
+                if uid and ex:
+                    uid_map[uid] = Path(ex)
+    return uid_map
+# ------------------------------------------------------------------------
 
 
-###############################################################################
-# Main
-###############################################################################
+# --------------------------- worker -------------------------------------
+def process_series(
+    uid: str,
+    example_path: Path,
+    overwrite: bool,
+    verbose: bool,
+) -> Tuple[str, int]:
+    count = 0
+    if overwrite:
+        for old in PREVIEWS_DIR.glob(f"{uid}_slice*.webp"):
+            old.unlink(missing_ok=True)
+        (PREVIEWS_DIR / f"{uid}.json").unlink(missing_ok=True)
+    elif (PREVIEWS_DIR / f"{uid}_slice0.webp").exists():
+        return uid, 0
+
+    series_dir = example_path.parent
+    if not series_dir.exists():
+        if verbose:
+            print(f"[WARN] {uid}: directory not found {series_dir}")
+        return uid, 0
+
+    files = sorted(p for p in series_dir.iterdir()
+                   if p.suffix.lower() in {".dcm", ".ima"} and p.is_file())
+    if not files:
+        if verbose:
+            print(f"[WARN] {uid}: no DICOMs")
+        return uid, 0
+
+    for i, idx in enumerate(choose_indices(len(files))):
+        src, dst = files[idx], PREVIEWS_DIR / f"{uid}_slice{i}.webp"
+        try:
+            ds = dcmread(src, force=True)
+            if "PixelData" not in ds or getattr(ds, "SamplesPerPixel", 1) not in (1, 3):
+                raise AttributeError("no usable PixelData")
+            save_slice(ds, dst)
+            count += 1
+        except (InvalidDicomError, AttributeError, NotImplementedError,
+                OSError, ValueError) as exc:
+            if verbose:
+                print(f"[SKIP] {uid} {src.name}: {exc}")
+        except Exception as exc:
+            if verbose:
+                traceback.print_exc()
+                print(f"[FAIL] {uid} {src.name}: {exc}")
+
+    if count:
+        meta = dict(uid=uid, total=len(files), written=count, folder=str(series_dir))
+        (PREVIEWS_DIR / f"{uid}.json").write_text(json.dumps(meta))
+    return uid, count
+# ------------------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Generate 8 WebP previews per SeriesInstanceUID",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--dicom",
-        required=True,
-        type=Path,
-        help="Root directory containing DICOM studies",
-    )
-    parser.add_argument(
-        "--manifest",
-        default=Path("series_info.tsv"),
-        type=Path,
-        help="TSV created by extract_dicom_headers.py (used to know which SeriesUIDs exist)",
-    )
-    parser.add_argument(
-        "--outdir",
-        default=Path("previews"),
-        type=Path,
-        help="Where to write <SeriesUID>_slice*.webp thumbnails",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Regenerate previews even if they already exist",
-    )
-    return parser.parse_args()
-
-
+# --------------------------- main ---------------------------------------
 def main():
-    args = parse_args()
+    ap = argparse.ArgumentParser(description="Generate WebP previews into ./previews/")
+    ap.add_argument("--dicom", required=True, type=Path,
+                    help="DICOM root (unused; kept for symmetry)")
+    ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
 
-    if not args.dicom.exists():
-        sys.exit(f"[ERROR] DICOM root {args.dicom} does not exist")
+    PREVIEWS_DIR.mkdir(exist_ok=True)
 
-    # 1. Build mapping SeriesUID → list[file]
-    print("🔍  Scanning DICOM tree …")
-    series_to_files = gather_series_files(args.dicom)
-    print(f"   Found {len(series_to_files):,} unique SeriesInstanceUIDs")
+    series_map = load_manifest()
+    print(f"🗂️   {len(series_map):,} series in manifest")
 
-    # 2. Determine which UIDs we actually need from manifest (keeps pipeline tidy)
-    needed_uids: set[str] = set()
-    if args.manifest.exists():
-        with args.manifest.open() as f:
-            # Header row uses readable names; Series Instance UID col is exactly that string
-            header = f.readline().rstrip("\n").split("\t")
-            try:
-                sid_col = header.index("Series Instance UID")
-            except ValueError:
-                sid_col = header.index("0020000E")  # fallback if using hex
-            for line in f:
-                uid = line.rstrip("\n").split("\t")[sid_col]
-                if uid:
-                    needed_uids.add(uid)
-    else:
-        needed_uids = set(series_to_files.keys())  # label-less pilot
+    max_workers = max(4, multiprocessing.cpu_count() * 2)
+    written_total, skipped = 0, 0
 
-    # Debug: warn if manifest expects a UID we didn't find
-    missing = needed_uids - set(series_to_files.keys())
-    if missing:
-        print(f"[WARN] {len(missing)} SeriesUIDs listed in manifest but not on disk")
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(process_series, uid, ex_path,
+                               args.overwrite, args.verbose)
+                   for uid, ex_path in series_map.items()]
+        for fut in tqdm(as_completed(futures), total=len(futures),
+                        desc="Generating previews"):
+            _uid, n = fut.result()
+            if n:
+                written_total += n
+            else:
+                skipped += 1
 
-    # 3. Create output folder
-    args.outdir.mkdir(parents=True, exist_ok=True)
-
-    # 4. Generate previews
-    todo_uids = needed_uids & set(series_to_files.keys())
-    for uid in tqdm(sorted(todo_uids), desc="Generating previews"):
-        slice_paths = series_to_files[uid]
-        if not slice_paths:
-            continue
-        # Already done?
-        slice0_path = args.outdir / f"{uid}_slice0.webp"
-        if slice0_path.exists() and not args.overwrite:
-            continue
-
-        chosen_idx = choose_slice_indices(len(slice_paths), 8)
-        for i, idx in enumerate(chosen_idx):
-            src = slice_paths[idx]
-            dst = args.outdir / f"{uid}_slice{i}.webp"
-            try:
-                ds = pydicom.dcmread(src, force=True)
-                save_slice_webp(ds, dst)
-            except Exception as exc:
-                print(f"[WARN]  Failed {uid} slice {i} ({src.name}): {exc}")
-
-        # Optionally write sidecar JSON
-        meta = {
-            "uid": uid,
-            "total_slices": len(slice_paths),
-            "selected_indices": chosen_idx,
-            "source_paths": [str(slice_paths[i]) for i in chosen_idx],
-        }
-        with (args.outdir / f"{uid}.json").open("w") as f:
-            json.dump(meta, f)
-
-    print(f"\n✅  Previews stored in {args.outdir.resolve()}")
+    print(f"✅  Wrote {written_total} WebP slices "
+          f"({len(series_map) - skipped} series). {skipped} series skipped.")
+    print("   Output:", PREVIEWS_DIR.resolve())
 
 
 if __name__ == "__main__":

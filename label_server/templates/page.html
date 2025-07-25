@@ -9,10 +9,23 @@
     {% set uid = series["Series Instance UID"] or series["0020000E"] %}
     {% set is_done = series["Annotation"] %}
     <div class="series-card {% if is_done %}done{% endif %}">
-      <div class="meta">
-        <strong>Series {{ series["Series Number"] }}</strong>
-        &mdash; {{ series["Series Description"] or series["Protocol Name"] or "--" }}
-      </div>
+		<div class="meta">
+		  <strong>Series {{ series["Series Number"] }}</strong>
+		  &mdash; {{ series["Series Description"] or series["Protocol Name"] or "--" }}
+		  <br>
+		  <small>
+			Protocol: {{ series["Protocol Name"] or "--" }} |
+			TR: {{ series["Repetition Time"] or "--" }} |
+			TE: {{ series["Echo Time"] or "--" }} |
+			FA: {{ series["Flip Angle"] or "--" }} |
+			TI: {{ series["Inversion Time"] or "--" }} |
+			Prep‑Delay: {{ series["Prepulse Delay"] or "--" }} |
+			SliceThk: {{ series["Slice Thickness"] or "--" }} |
+			Spacing: {{ series["Spacing Between Slices"] or "--" }} |
+			Plane: {{ series['Plane Orientation'] or '--' }}
+
+		  </small>
+		</div>
 
       <!-- thumbnail scroll strip -->
       <div class="scroll-box">
