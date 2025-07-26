@@ -268,7 +268,7 @@ def main():
     merged   = merge_existing(DEFAULT_TSV, fresh)
     write_manifest(merged, DEFAULT_TSV)
 
-    print(f"✅  Manifest written to {DEFAULT_TSV.relative_to(SCRIPT_DIR)} "
+    print(f"  Manifest written to {DEFAULT_TSV.relative_to(SCRIPT_DIR)} "
           f"({len(merged):,} series)")
 # -----------------------------------------------------------------------
 

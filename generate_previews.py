@@ -133,7 +133,7 @@ def main():
     PREVIEWS_DIR.mkdir(exist_ok=True)
 
     series_map = load_manifest()
-    print(f"🗂️   {len(series_map):,} series in manifest")
+    print(f"[INFO] {len(series_map):,} series in manifest")
 
     max_workers = max(4, multiprocessing.cpu_count() * 2)
     written_total, skipped = 0, 0
@@ -150,9 +150,9 @@ def main():
             else:
                 skipped += 1
 
-    print(f"✅  Wrote {written_total} WebP slices "
+    print(f"Wrote {written_total} WebP slices "
           f"({len(series_map) - skipped} series). {skipped} series skipped.")
-    print("   Output:", PREVIEWS_DIR.resolve())
+    print("Output:", PREVIEWS_DIR.resolve())
 
 
 if __name__ == "__main__":
