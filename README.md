@@ -31,7 +31,7 @@ conda install -c conda-forge pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg
 
 ```bash
 # 0 · sort your studies first
-dicom_sort /raw/DICOMs /sorted/DICOMs        # toolkit v0.1.5
+       # use release dicom sorting toolkit v0.1.5
 
 cd dicom-labeler
 
