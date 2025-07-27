@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""dicom_labeler_gui.py – PyQt5 front‑end for the four‑step pipeline."""
+"""dicom_labeler_gui.py – PyQt5 front‑end for the five‑step pipeline.
+
+NEW IN THIS VERSION
+-------------------
+* Added **5 · Copy subset** button that wraps ``move_labelled_subset.py``.
+  – Uses the DICOM root selected at the top as *input* directory.
+  – Prompts for an *output* directory via ``QFileDialog``.
+  – Prompts for one or more *search terms* via ``QInputDialog`` (comma‑separated).
+  – Runs the subset script in the background and streams its stdout to the log.
+"""
 from __future__ import annotations
 
 import os, sys, subprocess, threading, webbrowser
@@ -9,8 +18,8 @@ from typing import List
 from PyQt5.QtCore import Qt, pyqtSignal, QObject
 from PyQt5.QtGui import QTextCursor
 from PyQt5.QtWidgets import (
-    QApplication, QFileDialog, QGridLayout, QHBoxLayout, QLineEdit,
-    QPushButton, QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QGridLayout, QHBoxLayout, QInputDialog,
+    QLineEdit, QPushButton, QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
 # ---------------------------------------------------------------------------
@@ -20,6 +29,7 @@ PYTHON_EXE = Path(sys.executable).resolve()
 EXTRACT_SCRIPT = REPO_ROOT / "extract_dicom_headers.py"
 PREVIEW_SCRIPT = REPO_ROOT / "generate_previews.py"
 APPLY_SCRIPT   = REPO_ROOT / "apply_labels.py"
+SUBSET_SCRIPT  = REPO_ROOT / "move_labelled_subset.py"   # <── NEW
 
 FLASK_APP_ENV  = "label_server.app:create_flask_app"
 FLASK_PORT     = "5000"
@@ -74,14 +84,18 @@ class MainWindow(QWidget):
         self.btn_preview  = QPushButton("2 · Generate previews")
         self.btn_annotate = QPushButton("3 · Open annotation UI")
         self.btn_apply    = QPushButton("4 · Apply labels to DICOMs")
-        for b in (self.btn_extract, self.btn_preview, self.btn_annotate, self.btn_apply):
+        self.btn_subset   = QPushButton("5 · Copy subset")           # <── NEW
+        for b in (self.btn_extract, self.btn_preview, self.btn_annotate, self.btn_apply, self.btn_subset):
             b.setEnabled(False)
             b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.btn_extract .clicked.connect(self._do_extract)
         self.btn_preview .clicked.connect(self._do_preview)
         self.btn_annotate.clicked.connect(self._do_flask)
         self.btn_apply   .clicked.connect(self._do_apply)
-        col_btns = QVBoxLayout(); [col_btns.addWidget(b) for b in (self.btn_extract, self.btn_preview, self.btn_annotate, self.btn_apply)]
+        self.btn_subset  .clicked.connect(self._do_subset)            # <── NEW
+        col_btns = QVBoxLayout(); [col_btns.addWidget(b) for b in (
+            self.btn_extract, self.btn_preview, self.btn_annotate, self.btn_apply, self.btn_subset
+        )]
 
         # Log area
         self.log = QTextEdit(readOnly=True)
@@ -106,7 +120,7 @@ class MainWindow(QWidget):
 
     def _validate(self):
         ok = self._root().is_dir()
-        for b in (self.btn_extract, self.btn_preview, self.btn_annotate, self.btn_apply):
+        for b in (self.btn_extract, self.btn_preview, self.btn_annotate, self.btn_apply, self.btn_subset):
             b.setEnabled(ok)
 
     def _browse(self):
@@ -130,6 +144,37 @@ class MainWindow(QWidget):
 
     def _do_apply(self):
         self._run_cmd([str(PYTHON_EXE), str(APPLY_SCRIPT), str(self._root())], "APPLY")
+
+    # ------------- subset (NEW) -------------
+    def _do_subset(self):
+        src_root = self._root()
+        if not src_root.is_dir():
+            self._append("[ERROR] Invalid DICOM root\n")
+            return
+
+        # --- destination directory ---
+        dest_dir = QFileDialog.getExistingDirectory(
+            self, "Choose destination directory for subset copy"
+        )
+        if not dest_dir:
+            return  # cancelled
+
+        # --- search terms ---
+        terms, ok = QInputDialog.getText(
+            self, "Protocol search terms",
+            ("Enter one or more ProtocolName search terms:\n"
+             "• Separate multiple terms with commas\n"
+             "• Example: seq_FLAIR_acq_3D, seq_gad"),
+        )
+        if not ok or not terms.strip():
+            return
+
+        cmd = [
+            str(PYTHON_EXE), str(SUBSET_SCRIPT),
+            "-t", terms.strip(),
+            str(src_root), dest_dir,
+        ]
+        self._run_cmd(cmd, "SUBSET")
 
     # ------------- flask -------------
     def _do_flask(self):
