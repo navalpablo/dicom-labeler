@@ -1,45 +1,84 @@
-# DICOM Series Labeler
+# DICOM Series Labeler
 
-Lightweight, local‑only toolkit for browsing and annotating neuro­imaging
-DICOM series (T1w, FLAIR, etc.).  
-You point it at a directory full of studies, it extracts metadata,
-generates 8‑slice thumbnails per series, and spins up a small Flask UI
-where you scroll through batches of 20 series and assign labels.  
-Annotations are written back to **series_info.tsv**; new labels are
-appended to **labels_config.txt**.
+Lightweight, local‑only **4‑step pipeline** for browsing, annotating and finally
+**writing labels back into DICOM headers** – now with a PyQt5 GUI and safe
+2D/3D/4D prefix support.
+
+> **Important**  
+> Before doing anything, sort your raw DICOMs with  
+> [`dicom_sorting_toolkit` v0.1.5](https://github.com/navalpablo/dicom_sorting_toolkit)  
+> so that every *SeriesInstanceUID* gets its own folder.  
+> All subsequent scripts assume this structure.
 
 ---
 
-## Quick start
+## Installation
 
 ```bash
-# 1 · create & activate conda env
-conda env create -f environment.yml        
+conda create -n dicom-labeler python=3.10            # or use mamba
 conda activate dicom-labeler
 
-# 2 · extract one row per series
-python extract_dicom_headers.py \
-    --dicom /path/to/DICOM_root \
-    --output series_info.tsv
+# core deps
+pip install pydicom tqdm pillow numpy flask pyqt5
 
-# 3 · generate 8‑slice WebP previews
-python generate_previews.py \
-    --dicom /path/to/DICOM_root \
-    --manifest series_info.tsv \
-    --outdir previews
-
-# 4 · launch labeling UI (bash)
-export FLASK_APP=label_server.app
-flask run                                   # open http://localhost:5000/
-
-# 4 · launch labeling UI (cmd)
-set FLASK_APP=label_server.app:create_flask_app
-flask run                                  # open http://localhost:5000/
-
-
+# (optional) enable JPEG‑LS / JPEG‑2000 compressed PixelData
+conda install -c conda-forge pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg
 ```
 
+---
 
+## Quick‑start (terminal)
+
+```bash
+# 0 · sort your studies first
+dicom_sort /raw/DICOMs /sorted/DICOMs        # toolkit v0.1.5
+
+cd dicom-labeler
+
+# 1 · extract one row per SeriesInstanceUID  →  series_info.tsv
+python extract_dicom_headers.py --dicom /sorted/DICOMs
+
+# 2 · generate 8‑slice WebP thumbnails per series  →  previews/
+python generate_previews.py --dicom /sorted/DICOMs
+
+# 3 · launch browser‑based annotator (Flask) on port 5000
+export FLASK_APP=label_server.app:create_flask_app
+flask run
+# open http://localhost:5000/ and assign labels
+
+# 4 · embed labels back into every DICOM or move DELETEd series
+python apply_labels.py /sorted/DICOMs -j 12
+```
+
+---
+
+## One‑click GUI
+
+```bash
+python dicom_labeler_gui.py
+```
+
+The PyQt5 window guides you through all four steps and streams live logs.
+
+---
+
+## Pipeline details
+
+| Step | Script | Output | Notes |
+|------|--------|--------|-------|
+| **1** | `extract_dicom_headers.py` | `series_info.tsv` | Fast header sweep, preserves existing Annotation column, infers plane orientation |
+| **2** | `generate_previews.py` | `previews/UID_slice*.webp` + `UID.json` | 8 evenly‑spaced slices, intensity‑windowed |
+| **3** | Flask UI (`label_server/`, or GUI) | modifies `series_info.tsv`, appends to `labels_config.txt` | Groups series by StudyUID; dropdown remembers custom labels |
+| **4** | `apply_labels.py` | edits DICOM files in‑place (atomic) or moves them under `WAITING_DELETION/` | Adds prefix `seq_{annotation}_acq_{2D/3D/4D}_plane_{plane}___` and keeps total length ≤ 64 bytes |
+
+### 2D / 3D / 4D rule
+
+* **4D** if *NumberOfTemporalPositions > 1*  
+* **3D** if *SliceThickness < 2 mm* **or** *SpacingBetweenSlices < 2 mm*  
+* **2D** otherwise (missing tags are ignored)
+
+`apply_labels.py` writes to a **temporary file** first, then atomically
+replaces the original to avoid corruption when deferred PixelData are used.
 
 ---
 
@@ -47,67 +86,32 @@ flask run                                  # open http://localhost:5000/
 
 ```
 dicom-labeler/
-├── extract_dicom_headers.py   # step 1
-├── generate_previews.py       # step 2
-├── label_server/              # step 3–4 (Flask app)
-│   ├── __init__.py
+├── dicom_labeler_gui.py       # optional PyQt5 front‑end
+├── extract_dicom_headers.py   # step 1
+├── generate_previews.py       # step 2
+├── apply_labels.py            # step 4 (safe, adds 2D/3D/4D prefix)
+├── label_server/              # Flask app (step 3)
 │   ├── app.py
-│   └── templates/
-│       ├── base.html
-│       └── page.html
-├── utils/
-│   ├── dicom_utils.py
-│   └── image_utils.py
-├── labels_config.txt          # label list (append‑only)
-├── series_info.tsv            # generated manifest (+Annotation col)
-├── previews/                  # generated WebP thumbnails
-├── environment.yml            # conda env spec
+│   ├── templates/
+│   └── static/
+├── series_info.tsv            # generated – git‑ignore
+├── previews/                  # generated – git‑ignore
+├── labels_config.txt          # label list – auto‑grows
 └── README.md
 ```
 
-*Generated files (`series_info.tsv`, `previews/`) should be **git‑ignored**.*
-
 ---
 
-## How it works
+## Tips
 
-1. **Extract metadata**  
-   `extract_dicom_headers.py` walks the directory, reads one DICOM header
-   per series (fast), and builds `series_info.tsv`.  
-   *Re‑run any time; existing Annotation values are preserved.*
-
-2. **Generate previews**  
-   `generate_previews.py` sorts slices by *InstanceNumber*, picks 8 evenly
-   spaced indices, rescales intensities (1–99 % window), and saves
-   `<SeriesUID>_slice0.webp … slice7.webp` under `previews/`.
-
-3. **Annotate in browser**  
-   `flask run` serves `/page/1` (20 series).  
-   * Pick an existing label from the dropdown **or** type a new one.  
-   * Click **Save Annotations** → TSV updated, new labels appended to
-     `labels_config.txt`, page auto‑advances.  
-   * Completed series are tinted green; header shows progress bar.
-
----
-
-## Tips & tricks
-
-* **Add labels later:** edit `labels_config.txt` (one per line) or just
-  type new values in the UI—​the file is appended automatically.
-* **Overwrite thumbnails:**  
-  `python generate_previews.py … --overwrite`
-* **Large datasets:** `extract_dicom_headers.py` reads only the first 5
-  DICOMs per folder; use `--read_all` for exhaustive scans.
-* **Compressed PixelData:** enable JPEG‑LS / JPEG‑2000 via  
-  `conda install pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg`.
-
----
-
-## Testing
-
-```bash
-pytest -q
-```
+* **Dry‑run** `apply_labels.py /path -n` to preview edits without touching
+  files (summary only).
+* **Logs** `apply_labels.py … -l actions.tsv` records every move / edit.
+* **Overwrite previews** `generate_previews.py … --overwrite`.
+* **Large datasets** Use `extract_dicom_headers.py --read_all` if your
+  series folders contain mixed sequences.
+* The GUI keeps a Flask server alive between clicks; reopen the browser
+  to continue labeling later.
 
 ---
 
