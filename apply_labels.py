@@ -2,7 +2,6 @@
 """
 apply_labels.py
 --------------------
-
 Embed labels from series_info.tsv into DICOM headers (or move DELETE series)
 without corrupting pixel data.
 
@@ -10,16 +9,20 @@ Features
 --------
 * Adds acquisition dimension tag: 2D / 3D / 4D based on:
     - 4D: NumberOfTemporalPositions > 1
-    - 3D: SliceThickness < 2 mm OR SpacingBetweenSlices < 2 mm
+    - 3D: SliceThickness < 2 mm OR SpacingBetweenSlices < 2 mm
     - 2D: otherwise
 * Prefix format:
     seq_{annotation}_acq_{dim}_plane_{plane}___{original_protocol_name}
-* Maintains 64‑byte limit for ProtocolName.
+* Maintains 64-byte limit for ProtocolName.
 * Optional --dry-run and --logfile.
 * Multithreaded processing with optional tqdm progress bar.
-* Atomic save to temporary file to avoid deferred‑read issues.
-"""
+* Atomic save to temporary file to avoid deferred-read issues.
 
+Modifications
+-------------
+- Only write new ProtocolName if an annotation is present.
+- Remove UNKNOWN fallback.
+"""
 from __future__ import annotations
 
 import argparse
@@ -37,15 +40,11 @@ import pydicom
 # optional progress bar
 try:
     from tqdm import tqdm  # type: ignore
-except ImportError:  # pragma: no cover
+except ImportError:
     tqdm = None
 
 MANIFEST = Path("series_info.tsv")
 PROTO_MAX_LEN = 64
-
-# --------------------------------------------------------------------------- #
-# Helper functions                                                            #
-# --------------------------------------------------------------------------- #
 
 def configure_logger(logfile: Path | None) -> logging.Logger | None:
     if logfile is None:
@@ -59,7 +58,6 @@ def configure_logger(logfile: Path | None) -> logging.Logger | None:
     )
     return logging.getLogger("apply_labels")
 
-
 def classify_acq_dim(ds) -> str:
     """Return '4D', '3D', or '2D'."""
     ntp = getattr(ds, "NumberOfTemporalPositions", None)
@@ -69,29 +67,21 @@ def classify_acq_dim(ds) -> str:
                 return "4D"
         except Exception:
             pass
-
     def to_float(val):
         try:
             return float(val)
         except Exception:
             return None
-
     st = to_float(getattr(ds, "SliceThickness", None))
     sb = to_float(getattr(ds, "SpacingBetweenSlices", None))
     if (st is not None and st < 2.0) or (sb is not None and sb < 2.0):
         return "3D"
     return "2D"
 
-
 def build_protocol_name(orig: str, annot: str, dim: str, plane: str) -> str:
     prefix = f"seq_{annot}_acq_{dim}_plane_{plane}___"
     max_orig_len = PROTO_MAX_LEN - len(prefix)
-    return f"{prefix}{(orig or '')[: max(max_orig_len, 0)]}"
-
-
-# --------------------------------------------------------------------------- #
-# Core worker                                                                 #
-# --------------------------------------------------------------------------- #
+    return f"{prefix}{(orig or '')[:max(max_orig_len, 0)]}"
 
 def handle_file(
     path: Path,
@@ -114,7 +104,10 @@ def handle_file(
         return "skipped"
 
     annot, plane = uid_map[uid]
-    if (annot or "").upper() == "DELETE":
+    # only apply when an annotation exists
+    if not annot:
+        return "unchanged"
+    if annot.upper() == "DELETE":
         if dry_run:
             if logger:
                 logger.info("dry-move\t%s", rel)
@@ -129,7 +122,7 @@ def handle_file(
     dim = classify_acq_dim(ds)
     new_proto = build_protocol_name(
         str(getattr(ds, "ProtocolName", "")),
-        annot or "UNKNOWN",
+        annot,
         dim,
         plane or "UNKNOWN",
     )
@@ -142,7 +135,6 @@ def handle_file(
         return "edited"
 
     ds.ProtocolName = new_proto
-
     # atomic save
     fh, tmp_name = tempfile.mkstemp(suffix=".dcm", dir=str(path.parent))
     os.close(fh)
@@ -156,11 +148,6 @@ def handle_file(
     if logger:
         logger.info("edit\t%s\t%s", rel, new_proto)
     return "edited"
-
-
-# --------------------------------------------------------------------------- #
-# Main                                                                        #
-# --------------------------------------------------------------------------- #
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -201,7 +188,6 @@ def main() -> None:
 
     trash_root = root / "WAITING_DELETION"
 
-    # gather files
     all_files = [
         p for p in root.rglob("*")
         if p.is_file() and p.suffix.lower() in {".dcm", ".ima", ""}
@@ -246,7 +232,6 @@ def main() -> None:
     )
     if args.dry_run:
         print("Dry-run mode: no files were modified.")
-
 
 if __name__ == "__main__":
     main()

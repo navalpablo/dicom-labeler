@@ -1,0 +1,7 @@
+python extract_dicom_headers.py --dicom ..\downloads --filter-dir
+python generate_previews.py  --dicom ..\downloads
+
+
+Annotate in the web UI (PyQt or Flask).
+
+python apply_labels.py ..\downloads

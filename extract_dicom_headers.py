@@ -6,10 +6,11 @@ extract_dicom_headers.py
 • One row per SeriesInstanceUID
 • Adds "Example File" (first slice path)
 • Adds "Plane Orientation"  (axial / coronal / sagittal / oblique / '')
-  – finds ImageOrientationPatient in classic *and* enhanced multi‑frame
+  – finds ImageOrientationPatient in classic *and* enhanced multi-frame
   – fallback 1: infers from PatientOrientation (0020,0020)
   – fallback 2: infers from ImagePositionPatient changes across slices
 • Keeps/merges existing Annotation column if TSV already exists
+• NEW: when run with --filter-dir, only emits series with "_DIR_" in description
 """
 from __future__ import annotations
 
@@ -24,10 +25,10 @@ from pydicom.errors import InvalidDicomError
 from tqdm import tqdm
 
 SCRIPT_DIR   = Path(__file__).resolve().parent
-DEFAULT_TSV  = SCRIPT_DIR / "series_info.tsv"        # <── hard‑coded
+DEFAULT_TSV  = SCRIPT_DIR / "series_info.tsv"
 
 # -------------------------------------------------------------------- #
-# Tag → column‑name mapping
+# Tag → column-name mapping
 # -------------------------------------------------------------------- #
 DICOM_FIELD_MAPPING: Dict[str, str] = OrderedDict(
     [
@@ -48,7 +49,7 @@ DICOM_FIELD_MAPPING: Dict[str, str] = OrderedDict(
         ("00200011", "Series Number"),
         ("0008103E", "Series Description"),
         ("0020000E", "Series Instance UID"),
-        ("00200037", "Image Orientation (Patient)"),   # for single‑frame
+        ("00200037", "Image Orientation (Patient)"),   # for single-frame
         ("00540081", "Number of Slices"),
         ("00181310", "Acquisition Matrix"),
         ("00280030", "Pixel Spacing"),
@@ -92,33 +93,29 @@ def infer_plane_from_patient_orientation(po: str) -> str:
     parts = po.upper().split('\\')
     if len(parts) != 2:
         return ""
-    row_dir = parts[0][0] if len(parts[0]) > 0 else ''
-    col_dir = parts[1][0] if len(parts[1]) > 0 else ''
-    if not row_dir or not col_dir:
-        return ""
+    row_dir = parts[0][0] if parts[0] else ''
+    col_dir = parts[1][0] if parts[1] else ''
     if row_dir in 'RL' and col_dir in 'AP':
         return "axial"
     if row_dir in 'RL' and col_dir in 'HF':
         return "coronal"
     if row_dir in 'AP' and col_dir in 'HF':
         return "sagittal"
-    # Negate directions or combinations might still fit
+    # rotated variants
     if row_dir in 'AP' and col_dir in 'RL':
-        return "axial"  # rotated axial
+        return "axial"
     if row_dir in 'HF' and col_dir in 'RL':
-        return "coronal"  # rotated
+        return "coronal"
     if row_dir in 'HF' and col_dir in 'AP':
-        return "sagittal"  # rotated
+        return "sagittal"
     return "oblique"
 
 def _orientation_from_ds(ds: pydicom.Dataset) -> Optional[List[float]]:
-    """Return 6 floats if found (classic or enhanced)."""
-    # 1) single‑frame
+    # single-frame
     elem = ds.get((0x0020, 0x0037))
     if elem and len(elem.value) == 6:
         return [float(v) for v in elem.value]
-
-    # 2) Enhanced MR/CT: Shared FG
+    # enhanced shared
     sfg = ds.get("SharedFunctionalGroupsSequence")
     if sfg:
         try:
@@ -127,8 +124,7 @@ def _orientation_from_ds(ds: pydicom.Dataset) -> Optional[List[float]]:
                 return [float(v) for v in ori]
         except Exception:
             pass
-
-    # 3) Per‑frame FG (fallback)
+    # per-frame FG
     pfg = ds.get("PerFrameFunctionalGroupsSequence")
     if pfg:
         try:
@@ -139,7 +135,6 @@ def _orientation_from_ds(ds: pydicom.Dataset) -> Optional[List[float]]:
             pass
     return None
 
-# -------------------------------------------------------------------- #
 def hex_tag(h: str) -> Tuple[int, int]:
     return int(h[:4], 16), int(h[4:], 16)
 
@@ -152,20 +147,18 @@ def extract_header(fp: Path) -> Tuple[Dict[str, str], Optional[List[float]], int
     for key in FIELDS:
         elem = ds.get(hex_tag(key))
         out[key] = str(elem.value) if elem else ""
-
+    # plane orientation
     ori = _orientation_from_ds(ds)
     plane = determine_plane(ori) if ori else ""
     if not plane:
-        po = ''
-        if 'PatientOrientation' in ds:
-            po_val = ds.PatientOrientation
-            po = '\\'.join(po_val) if isinstance(po_val, (list, tuple)) else str(po_val)
+        po_val = ds.get("PatientOrientation", "")
+        po = '\\'.join(po_val) if isinstance(po_val, (list, tuple)) else str(po_val)
         plane = infer_plane_from_patient_orientation(po)
     out[PLANE_COL] = plane
 
+    # position & instance number
     pos_elem = ds.get((0x0020, 0x0032))
     pos = [float(v) for v in pos_elem.value] if pos_elem and len(pos_elem.value) == 3 else None
-
     inst = int(ds.get((0x0020, 0x0013)).value) if ds.get((0x0020, 0x0013)) else 0
 
     return out, pos, inst
@@ -176,7 +169,6 @@ def find_files(root: Path, read_all: bool):
         for f in (files if read_all else files[:5]):
             yield Path(d) / f
 
-# -------------------------------------------------------------------- #
 def build_series_manifest(root: Path, read_all: bool):
     manifest: Dict[Tuple[str,str], Dict[str,str]] = OrderedDict()
     pos_per_series: defaultdict[Tuple[str,str], List[Tuple[int, List[float]]]] = defaultdict(list)
@@ -185,8 +177,8 @@ def build_series_manifest(root: Path, read_all: bool):
         info, pos, inst = extract_header(fp)
         if not info:
             continue
-        study_uid = info.get("0020000D", "")
-        series_uid = info.get("0020000E", "")
+        study_uid = info.get("0020000D","")
+        series_uid = info.get("0020000E","")
         if not (study_uid and series_uid):
             continue
         key = (study_uid, series_uid)
@@ -196,10 +188,10 @@ def build_series_manifest(root: Path, read_all: bool):
         if pos:
             pos_per_series[key].append((inst, pos))
 
-    # Fallback inference for series without plane (position changes)
+    # fallback for plane orientation
     for key, row in manifest.items():
         if row[PLANE_COL]:
-            continue  # already set
+            continue
         poss = pos_per_series[key]
         if len(poss) < 2:
             continue
@@ -212,10 +204,7 @@ def build_series_manifest(root: Path, read_all: bool):
         norm_delta = delta / np.linalg.norm(delta)
         idx = int(np.argmax(np.abs(norm_delta)))
         major = np.abs(norm_delta[idx])
-        if major < 0.8:
-            row[PLANE_COL] = "oblique"
-        else:
-            row[PLANE_COL] = ("sagittal", "coronal", "axial")[idx]
+        row[PLANE_COL] = ("sagittal","coronal","axial")[idx] if major >= 0.8 else "oblique"
 
     return manifest
 
@@ -226,11 +215,9 @@ def merge_existing(out_tsv: Path, fresh):
     with out_tsv.open(newline="") as f:
         rdr = csv.DictReader(f, delimiter="\t")
         for row in rdr:
-            key = (row.get("Study Instance UID") or row.get("0020000D",""),
-                   row.get("Series Instance UID") or row.get("0020000E",""))
+            key = (row.get("Study Instance UID",""), row.get("Series Instance UID",""))
             if key not in merged:
-                merged[key] = {tag: row.get(DICOM_FIELD_MAPPING[tag], "")
-                               for tag in FIELDS}
+                merged[key] = {tag: row.get(DICOM_FIELD_MAPPING[tag],"") for tag in FIELDS}
             merged[key][EXAMPLE_COL] = row.get(EXAMPLE_COL, merged[key].get(EXAMPLE_COL,""))
             merged[key][PLANE_COL]   = row.get(PLANE_COL,   merged[key].get(PLANE_COL,""))
             merged[key]["Annotation"]= row.get("Annotation","")
@@ -247,7 +234,6 @@ def write_manifest(data, out_tsv: Path):
             row["Annotation"]= info.get("Annotation","")
             w.writerow(row)
 
-# -------------------------------------------------------------------- #
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Extract one row per DICOM series; output fixed to series_info.tsv",
@@ -256,8 +242,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dicom", required=True, type=Path, help="DICOM root folder")
     p.add_argument("--read_all", action="store_true",
                    help="Inspect every file in each folder (slow)")
+    p.add_argument("--filter-dir", action="store_true",
+                   help="Only include series whose description contains '_DIR_'")
     return p.parse_args()
-
 
 def main():
     args = parse_args()
@@ -265,12 +252,19 @@ def main():
         sys.exit(f"[ERROR] DICOM root {args.dicom} not found")
 
     fresh = build_series_manifest(args.dicom, args.read_all)
-    merged   = merge_existing(DEFAULT_TSV, fresh)
-    write_manifest(merged, DEFAULT_TSV)
+    merged = merge_existing(DEFAULT_TSV, fresh)
 
-    print(f"  Manifest written to {DEFAULT_TSV.relative_to(SCRIPT_DIR)} "
-          f"({len(merged):,} series)")
-# -----------------------------------------------------------------------
+    # filter to DIR series if requested
+    if args.filter_dir:
+        filtered = OrderedDict()
+        for key, info in merged.items():
+            desc = info.get("0008103E","")  # Series Description
+            if "_DIR_" in desc.upper():
+                filtered[key] = info
+        merged = filtered
+
+    write_manifest(merged, DEFAULT_TSV)
+    print(f"  Manifest written to {DEFAULT_TSV.relative_to(SCRIPT_DIR)} ({len(merged):,} series)")
 
 if __name__ == "__main__":
     main()

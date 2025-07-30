@@ -15,14 +15,8 @@ Lightweight, local‑only **4‑step pipeline** for browsing, annotating and fin
 ## Installation
 
 ```bash
-conda create -n dicom-labeler python=3.10            # or use mamba
+conda env create -f environment.yml        
 conda activate dicom-labeler
-
-# core deps
-pip install pydicom tqdm pillow numpy flask pyqt5
-
-# (optional) enable JPEG‑LS / JPEG‑2000 compressed PixelData
-conda install -c conda-forge pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg
 ```
 
 ---

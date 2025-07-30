@@ -8,35 +8,50 @@
   {% for series in series_batch %}
     {% set uid = series["Series Instance UID"] or series["0020000E"] %}
     {% set is_done = series["Annotation"] %}
+    {% set desc = (series["Series Description"] or series["Protocol Name"] or "")|lower %}
     <div class="series-card {% if is_done %}done{% endif %}">
-		<div class="meta">
-		  <strong>Series {{ series["Series Number"] }}</strong>
-		  &mdash; {{ series["Series Description"] or series["Protocol Name"] or "--" }}
-		  <br>
-		  <small>
-			Protocol: {{ series["Protocol Name"] or "--" }} |
-			TR: {{ series["Repetition Time"] or "--" }} |
-			TE: {{ series["Echo Time"] or "--" }} |
-			FA: {{ series["Flip Angle"] or "--" }} |
-			TI: {{ series["Inversion Time"] or "--" }} |
-			Prep‑Delay: {{ series["Prepulse Delay"] or "--" }} |
-			SliceThk: {{ series["Slice Thickness"] or "--" }} |
-			Spacing: {{ series["Spacing Between Slices"] or "--" }} |
-			Plane: {{ series['Plane Orientation'] or '--' }}
-
-		  </small>
-		</div>
-
-      <!-- thumbnail scroll strip -->
-      <div class="scroll-box">
-        {% for idx in range(8) %}
-          <img src="{{ url_for('previews', filename=uid ~ '_slice' ~ idx ~ '.webp') }}"
-               alt="slice {{ idx }}"
-               onerror="this.style.display='none';">
-        {% endfor %}
+      <div class="meta">
+        <strong>Series {{ series["Series Number"] }}</strong>
+        &mdash; {{ series["Series Description"] or series["Protocol Name"] or "--" }}
+        <br>
+        <small>
+          Protocol: {{ series["Protocol Name"] or "--" }} |
+          TR: {{ series["Repetition Time"] or "--" }} |
+          TE: {{ series["Echo Time"] or "--" }} |
+          FA: {{ series["Flip Angle"] or "--" }} |
+          TI: {{ series["Inversion Time"] or "--" }} |
+          Prep-Delay: {{ series["Prepulse Delay"] or "--" }} |
+          SliceThk: {{ series["Slice Thickness"] or "--" }} |
+          Spacing: {{ series["Spacing Between Slices"] or "--" }} |
+          Plane: {{ series['Plane Orientation'] or '--' }}
+        </small>
       </div>
 
-      <!-- label input -->
+      {% if 'dir' in desc %}
+        <div class="scroll-box">
+          {% for idx in range(20) %}
+            <img src="{{ url_for('previews', filename=uid ~ '_slice' ~ idx ~ '.webp') }}"
+                 alt="slice {{ idx }}"
+                 onerror="this.style.display='none';">
+          {% endfor %}
+        </div>
+        <div class="scroll-box">
+          {% for idx in range(20, 40) %}
+            <img src="{{ url_for('previews', filename=uid ~ '_slice' ~ idx ~ '.webp') }}"
+                 alt="slice {{ idx }}"
+                 onerror="this.style.display='none';">
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="scroll-box">
+          {% for idx in range(8) %}
+            <img src="{{ url_for('previews', filename=uid ~ '_slice' ~ idx ~ '.webp') }}"
+                 alt="slice {{ idx }}"
+                 onerror="this.style.display='none';">
+          {% endfor %}
+        </div>
+      {% endif %}
+
       <div style="margin-top:.4rem;">
         <label for="label_{{ uid }}">Label</label>
         <input list="label-options"
@@ -48,22 +63,24 @@
     </div>
   {% endfor %}
 
-  <!-- datalist rendered once per page -->
   <datalist id="label-options">
     {% for l in labels %}
       <option value="{{ l }}">
     {% endfor %}
   </datalist>
 
-  <button type="submit" style="padding:.5rem 1.2rem; font-size:1rem;">Save Annotations</button>
+  <button type="submit" style="padding:.5rem 1.2rem; font-size:1rem;">
+    Save Annotations
+  </button>
 </form>
 
-<!-- page navigation -->
 <div class="nav">
   {% if page_num > 1 %}
     <a href="{{ url_for('page', page_num=page_num-1) }}">&laquo; Prev</a>
   {% endif %}
-  <span style="padding:.4rem 1rem; border:1px solid #ccc; border-radius:4px;">Page {{ page_num }} / {{ total_pages }}</span>
+  <span style="padding:.4rem 1rem; border:1px solid #ccc; border-radius:4px;">
+    Page {{ page_num }} / {{ total_pages }}
+  </span>
   {% if page_num < total_pages %}
     <a href="{{ url_for('page', page_num=page_num+1) }}">Next &raquo;</a>
   {% endif %}

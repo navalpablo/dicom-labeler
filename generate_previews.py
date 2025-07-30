@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-generate_previews.py – final, fault‑tolerant
+generate_previews.py – final, fault-tolerant
 ============================================
 • Reads ./series_info.tsv
 • Writes WebPs to ./previews/
-• Parallel per‑series, skips non‑image files, RGB→gray, etc.
+• Parallel per-series, skips non-image files, RGB→gray, etc.
+• DIR sequences get 40 slices (20 foot-end + 20 around centre)
+• Others still get up to eight evenly spaced slices
 """
 from __future__ import annotations
 
@@ -26,14 +28,11 @@ PREVIEWS_DIR = SCRIPT_DIR / "previews"
 EXAMPLE_COL  = "Example File"
 # ------------------------------------------------------------------------
 
-
-# --------------------------- helpers ------------------------------------
 def normalize_uint8(arr: np.ndarray) -> np.ndarray:
     lo, hi = np.percentile(arr.astype(np.float32), (1, 99))
     if hi <= lo:
         lo, hi = arr.min(), arr.max() or 1
     return ((np.clip(arr, lo, hi) - lo) / (hi - lo) * 255).astype(np.uint8)
-
 
 def to_grayscale(arr: np.ndarray) -> np.ndarray:
     if arr.ndim == 2:
@@ -42,40 +41,74 @@ def to_grayscale(arr: np.ndarray) -> np.ndarray:
         return arr.mean(axis=-1)
     raise ValueError("Unsupported pixel array shape")
 
-
 def save_slice(ds: pydicom.Dataset, dst: Path):
     Image.fromarray(normalize_uint8(to_grayscale(ds.pixel_array)), mode="L") \
          .save(dst, format="WEBP", quality=85)
 
-
 def choose_indices(n: int, k: int = 8) -> List[int]:
+    """Select k evenly spaced indices from 0..n-1."""
     return list(range(n)) if n <= k else [round(i * (n - 1) / (k - 1)) for i in range(k)]
 
+def choose_dir_indices(n: int) -> List[int]:
+    """
+    Return indices for DIR series:
+    - first 20 slices (foot end)
+    - 20 slices around the middle
+    """
+    if n <= 40:
+        return list(range(n))
+    first20 = list(range(20))
+    mid_start = max(0, n//2 - 10)
+    mid_end = mid_start + 20
+    if mid_end > n:
+        mid_start = n - 20
+        mid_end = n
+    second20 = list(range(mid_start, mid_end))
+    return first20 + second20
 
-def load_manifest() -> Dict[str, Path]:
+def load_manifest() -> Dict[str, Tuple[Path, bool]]:
+    """
+    Returns a map: SeriesInstanceUID → (example_file_path, is_dir_flag)
+    """
     if not MANIFEST_TSV.exists():
         sys.exit(f"[ERROR] Manifest {MANIFEST_TSV} not found")
-    uid_map: Dict[str, Path] = {}
+    uid_map: Dict[str, Tuple[Path, bool]] = {}
     with MANIFEST_TSV.open() as f:
         header = f.readline().rstrip("\n").split("\t")
-        uid_idx, ex_idx = header.index("Series Instance UID"), header.index(EXAMPLE_COL)
+        uid_idx = header.index("Series Instance UID")
+        ex_idx  = header.index(EXAMPLE_COL)
+        # optional: find Series Description column
+        desc_idx = header.index("Series Description") if "Series Description" in header else -1
+
         for line in f:
             cols = line.rstrip("\n").split("\t")
-            if len(cols) > max(uid_idx, ex_idx):
-                uid, ex = cols[uid_idx], cols[ex_idx]
-                if uid and ex:
-                    uid_map[uid] = Path(ex)
+            if len(cols) <= max(uid_idx, ex_idx):
+                continue
+            uid = cols[uid_idx]
+            ex  = cols[ex_idx]
+            if not (uid and ex):
+                continue
+
+            is_dir = False
+            if desc_idx >= 0 and len(cols) > desc_idx:
+                desc = cols[desc_idx]
+                if desc and "_DIR_" in desc.upper():
+                    is_dir = True
+
+            uid_map[uid] = (Path(ex), is_dir)
     return uid_map
-# ------------------------------------------------------------------------
 
-
-# --------------------------- worker -------------------------------------
 def process_series(
     uid: str,
     example_path: Path,
+    is_dir: bool,
     overwrite: bool,
     verbose: bool,
 ) -> Tuple[str, int]:
+    """
+    Generate preview slices for a series.
+    Returns (UID, number_of_slices_written).
+    """
     count = 0
     if overwrite:
         for old in PREVIEWS_DIR.glob(f"{uid}_slice*.webp"):
@@ -97,8 +130,10 @@ def process_series(
             print(f"[WARN] {uid}: no DICOMs")
         return uid, 0
 
-    for i, idx in enumerate(choose_indices(len(files))):
-        src, dst = files[idx], PREVIEWS_DIR / f"{uid}_slice{i}.webp"
+    indices = choose_dir_indices(len(files)) if is_dir else choose_indices(len(files))
+    for i, idx in enumerate(indices):
+        src = files[idx]
+        dst = PREVIEWS_DIR / f"{uid}_slice{i}.webp"
         try:
             ds = dcmread(src, force=True)
             if "PixelData" not in ds or getattr(ds, "SamplesPerPixel", 1) not in (1, 3):
@@ -118,10 +153,7 @@ def process_series(
         meta = dict(uid=uid, total=len(files), written=count, folder=str(series_dir))
         (PREVIEWS_DIR / f"{uid}.json").write_text(json.dumps(meta))
     return uid, count
-# ------------------------------------------------------------------------
 
-
-# --------------------------- main ---------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Generate WebP previews into ./previews/")
     ap.add_argument("--dicom", required=True, type=Path,
@@ -139,12 +171,14 @@ def main():
     written_total, skipped = 0, 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(process_series, uid, ex_path,
-                               args.overwrite, args.verbose)
-                   for uid, ex_path in series_map.items()]
+        futures = [
+            pool.submit(process_series, uid, ex_path, is_dir,
+                        args.overwrite, args.verbose)
+            for uid, (ex_path, is_dir) in series_map.items()
+        ]
         for fut in tqdm(as_completed(futures), total=len(futures),
                         desc="Generating previews"):
-            _uid, n = fut.result()
+            _, n = fut.result()
             if n:
                 written_total += n
             else:
@@ -153,7 +187,6 @@ def main():
     print(f"Wrote {written_total} WebP slices "
           f"({len(series_map) - skipped} series). {skipped} series skipped.")
     print("Output:", PREVIEWS_DIR.resolve())
-
 
 if __name__ == "__main__":
     main()
